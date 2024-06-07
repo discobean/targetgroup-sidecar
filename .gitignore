@@ -13,3 +13,4 @@
 vendor
 Gopkg.lock
 .idea
+targetgroup-sidecar
