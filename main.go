@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/aws/ec2metadata"
@@ -13,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -23,8 +23,9 @@ var (
 	monitorSpotTermination bool
 	spotTerminationUrl     = "http://169.254.169.254/latest/meta-data/spot/termination-time"
 
-	gracefulStop = make(chan os.Signal)
-	sess         = session.Must(session.NewSession())
+	startTearDownTargetGroups = make(chan os.Signal)
+	stopTerminationMonitoring = make(chan os.Signal)
+	sess                      = session.Must(session.NewSession())
 )
 
 func configureFromFlags() {
@@ -50,11 +51,10 @@ func dumpConfig() {
 	log.Infof("MONITORSPOT=%v", monitorSpotTermination)
 }
 
-func catchSignals(cancelFunc context.CancelFunc) {
-	sig := <-gracefulStop
+func catchSignals() {
+	sig := <-startTearDownTargetGroups
 	log.Infof("Caught Signal: %+v", sig)
 
-	cancelFunc()
 	tearDownTargetGroups()
 }
 
@@ -120,9 +120,9 @@ func setupTargetGroups() {
 		}
 
 		select {
-		case sig := <-gracefulStop:
+		case sig := <-startTearDownTargetGroups:
 			tearDownTargetGroups()
-			log.Fatalf("Caught Signal before change: %+v", sig)
+			log.Fatalf("Caught terminate signal during setup of target groups: %+v", sig)
 		default:
 		}
 
@@ -158,7 +158,7 @@ func setupTargetGroups() {
 	log.Print("Registered all instances onto the targetgroups")
 }
 
-func monitorSpotTerminationSignal(ctx context.Context) {
+func monitorSpotTerminationSignal() {
 	log.Info("Monitoring Spot Termination Signal")
 	log.Info("Note - Container MetadataOptions.HttpTokens must be optional to view termination notice")
 
@@ -176,9 +176,10 @@ func monitorSpotTerminationSignal(ctx context.Context) {
 
 	for {
 		select {
-		case <-ctx.Done():
-			log.Info("Stopping monitoring of Spot Termination Signal")
+		case <-stopTerminationMonitoring:
+			log.Info("Stopping monitoring for spot termination signal")
 			return
+
 		case <-ticker.C:
 			resp, err := http.Get(spotTerminationUrl)
 			if err != nil {
@@ -188,7 +189,8 @@ func monitorSpotTerminationSignal(ctx context.Context) {
 
 			if resp.StatusCode == 200 {
 				log.Info("Spot instance termination notice received")
-				gracefulStop <- syscall.SIGTERM
+				log.Info("Sending signal to start teardown of target groups")
+				startTearDownTargetGroups <- syscall.SIGTERM
 				return
 			}
 
@@ -201,16 +203,28 @@ func main() {
 	configureFromFlags()
 	dumpConfig()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel() // Ensure cancel is called to release resources
+	var wg sync.WaitGroup // Declare a WaitGroup
 
 	if monitorSpotTermination {
-		go monitorSpotTerminationSignal(ctx)
+		signal.Notify(stopTerminationMonitoring, syscall.SIGTERM)
+		signal.Notify(stopTerminationMonitoring, syscall.SIGINT)
+
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			monitorSpotTerminationSignal()
+		}()
 	}
 
-	signal.Notify(gracefulStop, syscall.SIGTERM)
-	signal.Notify(gracefulStop, syscall.SIGINT)
+	signal.Notify(startTearDownTargetGroups, syscall.SIGTERM)
+	signal.Notify(startTearDownTargetGroups, syscall.SIGINT)
 
-	setupTargetGroups()
-	catchSignals(cancel)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		setupTargetGroups()
+		catchSignals()
+	}()
+
+	wg.Wait()
 }
