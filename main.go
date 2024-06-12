@@ -8,30 +8,24 @@ import (
 	"github.com/aws/aws-sdk-go/service/elbv2"
 	"github.com/namsral/flag"
 	log "github.com/sirupsen/logrus"
-	"net/http"
 	"os"
 	"os/signal"
 	"strings"
-	"sync"
 	"syscall"
-	"time"
 )
 
 var (
-	instanceId             string
-	targetGroupIds         string
-	monitorSpotTermination bool
-	spotTerminationUrl     = "http://169.254.169.254/latest/meta-data/spot/termination-time"
+	instanceId         string
+	targetGroupIds     string
+	spotTerminationUrl = "http://169.254.169.254/latest/meta-data/spot/termination-time"
 
-	startTearDownTargetGroups = make(chan os.Signal)
-	stopTerminationMonitoring = make(chan os.Signal)
-	sess                      = session.Must(session.NewSession())
+	gracefulStop = make(chan os.Signal)
+	sess         = session.Must(session.NewSession())
 )
 
 func configureFromFlags() {
 	flag.StringVar(&instanceId, "instanceid", "metadata", "instance id to use, or use metadata")
 	flag.StringVar(&targetGroupIds, "targetgroupids", "", "comma separated list of target group ids")
-	flag.BoolVar(&monitorSpotTermination, "monitorspot", false, "Monitor Spot Termination and remove targetgroups")
 	flag.Parse()
 
 	if instanceId == "metadata" {
@@ -48,11 +42,10 @@ func configureFromFlags() {
 func dumpConfig() {
 	log.Infof("INSTANCEID=%v\n", instanceId)
 	log.Infof("TARGETGROUPIDS=%v\n", targetGroupIds)
-	log.Infof("MONITORSPOT=%v", monitorSpotTermination)
 }
 
 func catchSignals() {
-	sig := <-startTearDownTargetGroups
+	sig := <-gracefulStop
 	log.Infof("Caught Signal: %+v", sig)
 
 	tearDownTargetGroups()
@@ -120,7 +113,7 @@ func setupTargetGroups() {
 		}
 
 		select {
-		case sig := <-startTearDownTargetGroups:
+		case sig := <-gracefulStop:
 			tearDownTargetGroups()
 			log.Fatalf("Caught terminate signal during setup of target groups: %+v", sig)
 		default:
@@ -158,73 +151,12 @@ func setupTargetGroups() {
 	log.Print("Registered all instances onto the targetgroups")
 }
 
-func monitorSpotTerminationSignal() {
-	log.Info("Monitoring Spot Termination Signal")
-	log.Info("Note - Container MetadataOptions.HttpTokens must be optional to view termination notice")
-
-	sess := session.Must(session.NewSession())
-	metadataSvc := ec2metadata.New(sess)
-
-	if !metadataSvc.Available() {
-		log.Warn("EC2 Metadata service is not available")
-		return
-	}
-
-	// Check every 5 seconds
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-stopTerminationMonitoring:
-			log.Info("Stopping monitoring for spot termination signal")
-			return
-
-		case <-ticker.C:
-			resp, err := http.Get(spotTerminationUrl)
-			if err != nil {
-				log.Error("Error checking termination notice: ", err)
-				continue
-			}
-
-			if resp.StatusCode == 200 {
-				log.Info("Spot instance termination notice received")
-				log.Info("Sending signal to start teardown of target groups")
-				startTearDownTargetGroups <- syscall.SIGTERM
-				return
-			}
-
-			log.Debug("No termination notice, continuing monitoring")
-		}
-	}
-}
-
 func main() {
 	configureFromFlags()
 	dumpConfig()
 
-	var wg sync.WaitGroup // Declare a WaitGroup
+	signal.Notify(gracefulStop, syscall.SIGTERM, syscall.SIGINT)
 
-	if monitorSpotTermination {
-		signal.Notify(stopTerminationMonitoring, syscall.SIGTERM)
-		signal.Notify(stopTerminationMonitoring, syscall.SIGINT)
-
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			monitorSpotTerminationSignal()
-		}()
-	}
-
-	signal.Notify(startTearDownTargetGroups, syscall.SIGTERM)
-	signal.Notify(startTearDownTargetGroups, syscall.SIGINT)
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		setupTargetGroups()
-		catchSignals()
-	}()
-
-	wg.Wait()
+	setupTargetGroups()
+	catchSignals()
 }
