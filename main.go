@@ -19,7 +19,7 @@ var (
 	targetGroupIds     string
 	spotTerminationUrl = "http://169.254.169.254/latest/meta-data/spot/termination-time"
 
-	gracefulStop = make(chan os.Signal)
+	gracefulStop = make(chan os.Signal, 1)
 	sess         = session.Must(session.NewSession())
 )
 
@@ -114,7 +114,6 @@ func setupTargetGroups() {
 
 		select {
 		case sig := <-gracefulStop:
-			tearDownTargetGroups()
 			log.Fatalf("Caught terminate signal during setup of target groups: %+v", sig)
 		default:
 		}
