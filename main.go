@@ -12,12 +12,13 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 )
 
 var (
-	instanceId         string
-	targetGroupIds     string
-	spotTerminationUrl = "http://169.254.169.254/latest/meta-data/spot/termination-time"
+	instanceId     string
+	targetGroupIds string
+	setupDelay     int
 
 	gracefulStop = make(chan os.Signal, 1)
 	sess         = session.Must(session.NewSession())
@@ -26,6 +27,7 @@ var (
 func configureFromFlags() {
 	flag.StringVar(&instanceId, "instanceid", "metadata", "instance id to use, or use metadata")
 	flag.StringVar(&targetGroupIds, "targetgroupids", "", "comma separated list of target group ids")
+	flag.IntVar(&setupDelay, "setupdelay", 10, "Wait time before setting up DNS (in seconds)")
 	flag.Parse()
 
 	if instanceId == "metadata" {
@@ -42,6 +44,7 @@ func configureFromFlags() {
 func dumpConfig() {
 	log.Infof("INSTANCEID=%v\n", instanceId)
 	log.Infof("TARGETGROUPIDS=%v\n", targetGroupIds)
+	log.Infof("SETUPDELAY=%v", setupDelay)
 }
 
 func catchSignals() {
@@ -98,6 +101,20 @@ func tearDownTargetGroups() {
 }
 
 func setupTargetGroups() {
+	// Wait for setupDelay, also check for signals during this period
+	if setupDelay > 0 {
+		log.Infof("Waiting %d seconds before setting up Target Groups (SETUPDELAY)", setupDelay)
+		for i := 0; i < setupDelay; i++ {
+			select {
+			case sig := <-gracefulStop:
+				log.Fatalf("Caught Signal during SETUPDELAY period: %+v", sig)
+			default:
+				time.Sleep(1 * time.Second)
+			}
+		}
+		log.Info("Finished waiting")
+	}
+
 	svc := elbv2.New(sess)
 
 	for _, targetGroupId := range strings.Split(targetGroupIds, ",") {
